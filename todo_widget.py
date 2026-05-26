@@ -959,9 +959,6 @@ class QuietTodoWidget:
 
     def toggle_lock(self) -> None:
         self.settings["locked"] = not self.settings["locked"]
-        if self.settings["locked"] and self.settings_window and self.settings_window.winfo_exists():
-            self.settings_window.destroy()
-            self.settings_window = None
         self.node_drag_key = None
         self.node_drag_parent_key = None
         self.node_drag_target = None
@@ -973,12 +970,10 @@ class QuietTodoWidget:
         self.send_to_bottom()
 
     def update_locked_layout(self) -> None:
-        locked = self.settings["locked"]
         self.lock_button.configure(
-            text="\ue785" if locked else "\ue72e",
+            text="\ue785" if self.settings["locked"] else "\ue72e",
             font=("Segoe MDL2 Assets", max(7, self.settings["font_size"] - 2)),
         )
-        state = "disabled" if locked else "normal"
         for button in (
             self.pending_button,
             self.completed_button,
@@ -986,11 +981,9 @@ class QuietTodoWidget:
             self.sync_button,
             self.collapse_all_button,
         ):
-            button.configure(state=state)
+            button.configure(state="normal")
 
     def set_task_view(self, view: str) -> None:
-        if self.settings["locked"]:
-            return
         if view not in ("pending", "completed"):
             return
         if view == "completed":
@@ -1146,13 +1139,11 @@ class QuietTodoWidget:
         )
         self.collapse_all_button.configure(
             text="\u25be\u25be" if all_collapsed else "\u25b8\u25b8",
-            state="normal" if keys and not self.settings["locked"] else "disabled",
+            state="normal" if keys else "disabled",
             disabledforeground=self.settings["muted"],
         )
 
     def toggle_all_collapsed(self) -> None:
-        if self.settings["locked"]:
-            return
         keys = self.collapsible_keys()
         if not keys:
             return
@@ -1909,8 +1900,6 @@ class QuietTodoWidget:
         )
 
     def request_sync(self) -> None:
-        if self.settings["locked"]:
-            return
         self.sync_remote()
 
     def schedule_sync(self) -> None:
@@ -1924,8 +1913,6 @@ class QuietTodoWidget:
         self.schedule_sync()
 
     def open_settings(self) -> None:
-        if self.settings["locked"]:
-            return
         if self.settings_window and self.settings_window.winfo_exists():
             self.settings_window.lift()
             return
