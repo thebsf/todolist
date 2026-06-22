@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import uuid
@@ -17,7 +18,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import tkinter as tk
-from tkinter import colorchooser, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 try:
     import msal
@@ -48,6 +49,7 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 TASKS_PATH = DATA_DIR / "local_tasks.json"
 REMOTE_TASKS_PATH = DATA_DIR / "remote_tasks.json"
 TOKEN_CACHE_PATH = DATA_DIR / "msal_cache.bin"
+DEFAULT_OBSIDIAN_PATH = Path.home() / "Documents" / "QuietTodoWidget" / "tasks.md"
 
 DEFAULT_SETTINGS = {
     "geometry": "356x460+120+140",
@@ -72,6 +74,8 @@ DEFAULT_SETTINGS = {
     "tenant": "common",
     "todo_list_id": "",
     "todo_list_name": "",
+    "obsidian_enabled": False,
+    "obsidian_path": str(DEFAULT_OBSIDIAN_PATH),
 }
 
 THEME_PRESETS = {
@@ -223,14 +227,22 @@ def normalize_settings(raw: dict | None) -> dict:
         settings["refresh_minutes"] = DEFAULT_SETTINGS["refresh_minutes"]
     for key in ("background", "foreground", "muted", "accent"):
         settings[key] = normalize_color(settings[key], DEFAULT_SETTINGS[key])
-    for key in ("auto_theme", "locked", "auto_start"):
+    for key in ("auto_theme", "locked", "auto_start", "obsidian_enabled"):
         settings[key] = bool(settings[key])
     preset = str(settings.get("theme_preset", "")).strip()
     if preset not in THEME_PRESETS:
         preset = "wallpaper" if settings["auto_theme"] else "custom"
     settings["theme_preset"] = preset
-    for key in ("geometry", "font_family", "client_id", "tenant", "todo_list_id"):
+    for key in (
+        "geometry",
+        "font_family",
+        "client_id",
+        "tenant",
+        "todo_list_id",
+        "obsidian_path",
+    ):
         settings[key] = str(settings.get(key, DEFAULT_SETTINGS[key])).strip()
+    settings["obsidian_path"] = settings["obsidian_path"] or str(DEFAULT_OBSIDIAN_PATH)
     settings["todo_list_name"] = str(settings.get("todo_list_name", "")).strip()
     settings["tenant"] = settings["tenant"] or "common"
     settings["task_view"] = (
@@ -325,6 +337,103 @@ class LocalTaskStore:
 
     def save(self, tasks: list[dict]) -> None:
         write_json(self.path, tasks)
+
+
+class ObsidianTaskStore:
+    TASK_RE = re.compile(
+        r"^(?P<indent>\s*)[-*+] \[(?P<checked>[ xX])\]\s+"
+        r"(?P<body>.*?)(?:\s*<!--qtw:(?P<id>[A-Za-z0-9_-]+)-->)?\s*$"
+    )
+    ID_RE = re.compile(r"\s*<!--qtw:[A-Za-z0-9_-]+-->\s*$")
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> list[dict]:
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return []
+        roots: list[dict] = []
+        stack: list[tuple[int, dict]] = []
+        for line in lines:
+            match = self.TASK_RE.match(line)
+            if not match:
+                continue
+            indent = match.group("indent").replace("\t", "    ")
+            depth = min(4, len(indent) // 2 + 1)
+            title = self.ID_RE.sub("", match.group("body")).strip()
+            if not title:
+                continue
+            task_id = match.group("id") or uuid.uuid4().hex
+            node = {
+                "id": task_id,
+                "title": title,
+                "completed": match.group("checked").lower() == "x",
+                "pinned": False,
+                "source": "local",
+                "subtasks": [],
+            }
+            if depth <= 1 or not stack:
+                roots.append(node)
+                stack = [(1, node)]
+                continue
+            while stack and stack[-1][0] >= depth:
+                stack.pop()
+            if not stack:
+                roots.append(node)
+                stack = [(1, node)]
+            else:
+                stack[-1][1].setdefault("subtasks", []).append(node)
+                stack.append((depth, node))
+        return roots
+
+    def save(self, tasks: list[dict]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        task_lines: list[str] = []
+
+        def write_node(node: dict, depth: int) -> None:
+            marker = "x" if node.get("completed") else " "
+            task_id = str(node.get("id") or uuid.uuid4().hex)
+            node["id"] = task_id
+            indent = "  " * depth
+            title = str(node.get("title", "")).strip()
+            if not title:
+                return
+            task_lines.append(f"{indent}- [{marker}] {title} <!--qtw:{task_id}-->")
+            for child in node.get("subtasks", []):
+                child["source"] = "local"
+                write_node(child, depth + 1)
+
+        for task in tasks:
+            task["source"] = "local"
+            write_node(task, 0)
+        lines = self.merge_with_existing_content(task_lines)
+        text = "\n".join(lines)
+        if text:
+            text += "\n"
+        temp = self.path.with_suffix(self.path.suffix + ".tmp")
+        temp.write_text(text, encoding="utf-8")
+        temp.replace(self.path)
+
+    def merge_with_existing_content(self, task_lines: list[str]) -> list[str]:
+        try:
+            existing = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return task_lines
+        task_indexes = [
+            index for index, line in enumerate(existing) if self.TASK_RE.match(line)
+        ]
+        if task_indexes:
+            start = task_indexes[0]
+            end = task_indexes[-1] + 1
+            return existing[:start] + task_lines + existing[end:]
+        if not existing:
+            return task_lines
+        separator = [] if not task_lines or not existing[-1].strip() else [""]
+        return existing + separator + task_lines
 
 
 class GraphTodoClient:
@@ -476,6 +585,13 @@ class GraphTodoClient:
             {"status": "completed" if value else "notStarted"},
         )
 
+    def update_task_title(self, list_id: str, task_id: str, title: str) -> None:
+        self.request(
+            "PATCH",
+            f"/me/todo/lists/{quote(list_id, safe='')}/tasks/{quote(task_id, safe='')}",
+            {"title": title},
+        )
+
     def update_task_pinned(self, list_id: str, task_id: str, value: bool) -> None:
         self.request(
             "PATCH",
@@ -511,6 +627,18 @@ class GraphTodoClient:
             {"isChecked": value},
         )
 
+    def update_subtask_title(
+        self, list_id: str, task_id: str, item_id: str, title: str
+    ) -> None:
+        self.request(
+            "PATCH",
+            (
+                f"/me/todo/lists/{quote(list_id, safe='')}/tasks/"
+                f"{quote(task_id, safe='')}/checklistItems/{quote(item_id, safe='')}"
+            ),
+            {"displayName": title},
+        )
+
     def delete_subtask(self, list_id: str, task_id: str, item_id: str) -> None:
         self.request(
             "DELETE",
@@ -526,8 +654,9 @@ class QuietTodoWidget:
         self.root = root
         self.settings = normalize_settings(load_json(SETTINGS_PATH, {}))
         self.local_store = LocalTaskStore(TASKS_PATH)
+        self.obsidian_store = ObsidianTaskStore(Path(self.settings["obsidian_path"]))
         self.remote_store = LocalTaskStore(REMOTE_TASKS_PATH, root_source="todo")
-        self.local_tasks = self.local_store.load()
+        self.local_tasks = self.load_local_tasks()
         self.remote_tasks: list[dict] = self.remote_store.load()
         self.todo_lists: list[dict] = []
         self.graph = GraphTodoClient(self.settings["client_id"], self.settings["tenant"])
@@ -541,8 +670,10 @@ class QuietTodoWidget:
         self.root_draft_circle: tk.Canvas | None = None
         self.subtask_draft_entry: tk.Entry | None = None
         self.refresh_job = None
+        self.obsidian_job = None
         self.theme_job = None
         self.bottom_job = None
+        self.obsidian_last_mtime_ns = self.current_obsidian_mtime()
         self.last_wallpaper_signature = None
         self.drag_origin = None
         self.resize_origin = None
@@ -562,6 +693,7 @@ class QuietTodoWidget:
         self.render_tasks()
         self.root.after(120, self._poll_results)
         self.schedule_sync()
+        self.schedule_obsidian_watch()
         self.schedule_theme_refresh()
         self.root.after(100, self.keep_at_desktop_bottom)
         if self.graph.has_account and self.settings["todo_list_id"]:
@@ -791,8 +923,6 @@ class QuietTodoWidget:
             self.button_style(collapse)
             if small:
                 collapse.configure(font=self.font(-1))
-            if self.settings["locked"]:
-                collapse.configure(state="disabled")
         return slot
 
     def apply_appearance(self, refresh_theme: bool = False) -> None:
@@ -1040,8 +1170,14 @@ class QuietTodoWidget:
     def display_tasks(self) -> list[dict]:
         tasks = self.local_tasks + self.remote_tasks
         self.ensure_task_order(tasks)
-        completed = self.settings["task_view"] == "completed"
-        shown = [task for task in tasks if task["completed"] == completed]
+        if self.settings["task_view"] == "completed":
+            shown = [
+                task
+                for task in tasks
+                if task["completed"] or self.has_visible_subtasks(task, self.task_key(task))
+            ]
+        else:
+            shown = [task for task in tasks if not task["completed"]]
         position = {key: index for index, key in enumerate(self.settings["task_order"])}
         return sorted(
             shown,
@@ -1124,8 +1260,6 @@ class QuietTodoWidget:
         return key in self.settings["collapsed_nodes"]
 
     def toggle_collapsed(self, key: str) -> None:
-        if self.settings["locked"]:
-            return
         collapsed = self.settings["collapsed_nodes"]
         if key in collapsed:
             collapsed.remove(key)
@@ -1134,19 +1268,34 @@ class QuietTodoWidget:
         write_json(SETTINGS_PATH, self.settings)
         self.render_tasks()
 
+    def is_visible_in_current_view(self, node: dict, node_key: str) -> bool:
+        if self.settings["task_view"] == "completed":
+            return bool(node.get("completed") or self.has_visible_subtasks(node, node_key))
+        return not bool(node.get("completed"))
+
+    def visible_subtasks(self, parent: dict, parent_key: str) -> list[dict]:
+        return [
+            child
+            for child in self.ordered_subtasks(parent, parent_key)
+            if self.is_visible_in_current_view(child, self.child_key(parent_key, child))
+        ]
+
+    def has_visible_subtasks(self, parent: dict, parent_key: str) -> bool:
+        return bool(self.visible_subtasks(parent, parent_key))
+
     def collapsible_keys(self, tasks: list[dict] | None = None) -> list[str]:
         keys = []
 
         def collect(parent: dict, parent_key: str) -> None:
-            for child in parent.get("subtasks", []):
+            for child in self.visible_subtasks(parent, parent_key):
                 child_key = self.child_key(parent_key, child)
-                if child.get("subtasks"):
+                if self.has_visible_subtasks(child, child_key):
                     keys.append(child_key)
                 collect(child, child_key)
 
         for task in tasks if tasks is not None else self.display_tasks():
             task_key = self.task_key(task)
-            if task.get("subtasks"):
+            if self.has_visible_subtasks(task, task_key):
                 keys.append(task_key)
             collect(task, task_key)
         return keys
@@ -1214,9 +1363,92 @@ class QuietTodoWidget:
                 item["subtasks"] = copy.deepcopy(self.settings["remote_nested"].get(key, []))
         return tasks
 
+    def merge_local_metadata(self, tasks: list[dict]) -> list[dict]:
+        existing: dict[str, dict] = {}
+
+        def collect(node: dict) -> None:
+            existing[str(node.get("id", ""))] = node
+            for child in node.get("subtasks", []):
+                collect(child)
+
+        for task in self.local_tasks if hasattr(self, "local_tasks") else []:
+            collect(task)
+
+        def apply(node: dict, is_root: bool) -> None:
+            prior = existing.get(str(node.get("id", "")))
+            node["source"] = "local"
+            if is_root and prior:
+                node["pinned"] = bool(prior.get("pinned", False))
+            for child in node.get("subtasks", []):
+                apply(child, False)
+
+        for task in tasks:
+            apply(task, True)
+        return tasks
+
+    def obsidian_sync_enabled(self) -> bool:
+        return bool(self.settings.get("obsidian_enabled") and self.settings.get("obsidian_path"))
+
+    def load_local_tasks(self) -> list[dict]:
+        json_tasks = self.local_store.load()
+        if not self.obsidian_sync_enabled():
+            return json_tasks
+        self.obsidian_store = ObsidianTaskStore(Path(self.settings["obsidian_path"]))
+        obsidian_tasks = self.obsidian_store.load()
+        if obsidian_tasks or self.obsidian_store.path.exists():
+            return self.merge_local_metadata(obsidian_tasks)
+        try:
+            self.obsidian_store.save(json_tasks)
+        except OSError:
+            pass
+        return json_tasks
+
+    def save_local_tasks(self) -> None:
+        self.local_store.save(self.local_tasks)
+        if self.obsidian_sync_enabled():
+            self.obsidian_store = ObsidianTaskStore(Path(self.settings["obsidian_path"]))
+            self.obsidian_store.save(self.local_tasks)
+            self.obsidian_last_mtime_ns = self.current_obsidian_mtime()
+
+    def sync_obsidian(self) -> bool:
+        if not self.obsidian_sync_enabled():
+            return False
+        self.obsidian_store = ObsidianTaskStore(Path(self.settings["obsidian_path"]))
+        if self.obsidian_store.path.exists():
+            self.local_tasks = self.merge_local_metadata(self.obsidian_store.load())
+        self.save_local_tasks()
+        self.obsidian_last_mtime_ns = self.current_obsidian_mtime()
+        now = datetime.now().strftime("%H:%M")
+        self.status_text.set(f"Obsidian 已同步 {now}")
+        self.render_tasks()
+        return True
+
+    def current_obsidian_mtime(self) -> int | None:
+        if not self.obsidian_sync_enabled():
+            return None
+        try:
+            return Path(self.settings["obsidian_path"]).stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def schedule_obsidian_watch(self) -> None:
+        if self.obsidian_job:
+            self.root.after_cancel(self.obsidian_job)
+        self.obsidian_job = self.root.after(2000, self._periodic_obsidian_watch)
+
+    def _periodic_obsidian_watch(self) -> None:
+        current = self.current_obsidian_mtime()
+        if current is not None and current != self.obsidian_last_mtime_ns:
+            try:
+                self.sync_obsidian()
+            except OSError as exc:
+                self.status_text.set(f"Obsidian 同步失败: {exc}")
+        self.obsidian_last_mtime_ns = self.current_obsidian_mtime()
+        self.schedule_obsidian_watch()
+
     def save_nested_changes(self, root_task: dict) -> None:
         if root_task["source"] == "local":
-            self.local_store.save(self.local_tasks)
+            self.save_local_tasks()
             return
         root_key = self.task_key(root_task)
         for child in root_task.get("subtasks", []):
@@ -1226,7 +1458,7 @@ class QuietTodoWidget:
         self.remote_store.save(self.remote_tasks)
 
     def save_all_task_trees(self) -> None:
-        self.local_store.save(self.local_tasks)
+        self.save_local_tasks()
         for task in self.remote_tasks:
             root_key = self.task_key(task)
             for child in task.get("subtasks", []):
@@ -1298,6 +1530,9 @@ class QuietTodoWidget:
     def render_task_row(self, task: dict) -> None:
         bg = self.settings["background"]
         fg = self.settings["muted"] if task["completed"] else self.settings["foreground"]
+        key = self.task_key(task)
+        visible_children = self.visible_subtasks(task, key)
+        context_only = self.settings["task_view"] == "completed" and not task["completed"]
         group = tk.Frame(
             self.tasks_frame,
             bg=bg,
@@ -1306,7 +1541,6 @@ class QuietTodoWidget:
             highlightbackground=bg,
         )
         group.pack(fill="x", pady=(1, 3))
-        key = self.task_key(task)
         self.drag_rows.append((key, "root", group))
         row = tk.Frame(group, bg=bg, bd=0)
         row.pack(fill="x")
@@ -1319,16 +1553,20 @@ class QuietTodoWidget:
             cursor="sb_v_double_arrow",
         )
         handle.pack(side="left", padx=(0, 3))
-        handle.bind(
-            "<ButtonPress-1>", lambda event, k=key: self.start_node_drag(k, "root", event)
-        )
-        handle.bind("<B1-Motion>", self.drag_node)
-        handle.bind("<ButtonRelease-1>", self.stop_node_drag)
+        if not context_only:
+            handle.bind(
+                "<ButtonPress-1>",
+                lambda event, k=key: self.start_node_drag(k, "root", event),
+            )
+            handle.bind("<B1-Motion>", self.drag_node)
+            handle.bind("<ButtonRelease-1>", self.stop_node_drag)
+        else:
+            handle.configure(cursor="")
         self.completion_button(
             row,
             task["completed"],
             None
-            if self.settings["locked"]
+            if self.settings["locked"] or context_only
             else lambda t=task: self.toggle_task(t, not t["completed"]),
         )
         pin = tk.Button(
@@ -1340,9 +1578,9 @@ class QuietTodoWidget:
         )
         pin.pack(side="left", padx=(0, 3))
         self.button_style(pin)
-        if self.settings["locked"]:
+        if self.settings["locked"] or context_only:
             pin.configure(state="disabled")
-        self.disclosure_slot(row, key, bool(task.get("subtasks")))
+        self.disclosure_slot(row, key, bool(visible_children))
         title = tk.Label(
             row,
             text=task["title"],
@@ -1354,6 +1592,12 @@ class QuietTodoWidget:
             wraplength=max(130, self.root.winfo_width() - 136),
         )
         title.pack(side="left", fill="x", expand=True, pady=2)
+        if not self.settings["locked"] and not context_only:
+            title.configure(cursor="xterm")
+            title.bind(
+                "<Button-1>",
+                lambda _event, t=task, w=title: self.start_task_title_edit(w, t),
+            )
         delete = tk.Button(
             row,
             text="\u00d7",
@@ -1374,12 +1618,12 @@ class QuietTodoWidget:
             add_sub.pack(side="right", padx=(2, 0))
             self.button_style(add_sub)
         self.button_style(delete)
-        if self.settings["locked"]:
+        if self.settings["locked"] or context_only:
             if add_sub:
                 add_sub.configure(state="disabled")
             delete.configure(state="disabled")
         if not self.is_collapsed(key):
-            for item in self.ordered_subtasks(task, key):
+            for item in visible_children:
                 self.render_subtask_row(group, task, task, item, key, 1)
             if (
                 self.settings["task_view"] == "pending"
@@ -1401,6 +1645,8 @@ class QuietTodoWidget:
         row = tk.Frame(group, bg=bg, bd=0)
         row.pack(fill="x", padx=(19 + (depth * 10), 0), pady=1)
         item_key = self.child_key(parent_key, item)
+        visible_children = self.visible_subtasks(item, item_key)
+        context_only = self.settings["task_view"] == "completed" and not item["completed"]
         self.drag_rows.append((item_key, parent_key, row))
         handle = tk.Label(
             row,
@@ -1411,31 +1657,41 @@ class QuietTodoWidget:
             cursor="sb_v_double_arrow",
         )
         handle.pack(side="left", padx=(0, 3))
-        handle.bind(
-            "<ButtonPress-1>",
-            lambda event, k=item_key, p=parent_key: self.start_node_drag(k, p, event),
-        )
-        handle.bind("<B1-Motion>", self.drag_node)
-        handle.bind("<ButtonRelease-1>", self.stop_node_drag)
+        if not context_only:
+            handle.bind(
+                "<ButtonPress-1>",
+                lambda event, k=item_key, p=parent_key: self.start_node_drag(k, p, event),
+            )
+            handle.bind("<B1-Motion>", self.drag_node)
+            handle.bind("<ButtonRelease-1>", self.stop_node_drag)
+        else:
+            handle.configure(cursor="")
         self.completion_button(
             row,
             item["completed"],
             None
-            if self.settings["locked"]
+            if self.settings["locked"] or context_only
             else lambda r=root_task, i=item: self.toggle_subtask(
                 r, i, not i["completed"]
             ),
             small=True,
         )
-        self.disclosure_slot(row, item_key, bool(item.get("subtasks")), small=True)
-        tk.Label(
+        self.disclosure_slot(row, item_key, bool(visible_children), small=True)
+        title = tk.Label(
             row,
             text=item["title"],
             bg=bg,
             fg=fg,
             font=self.font(-1),
             anchor="w",
-        ).pack(side="left", fill="x", expand=True)
+        )
+        title.pack(side="left", fill="x", expand=True)
+        if not self.settings["locked"] and not context_only:
+            title.configure(cursor="xterm")
+            title.bind(
+                "<Button-1>",
+                lambda _event, r=root_task, i=item, w=title: self.start_subtask_title_edit(w, r, i),
+            )
         delete = tk.Button(
             row,
             text="\u00d7",
@@ -1458,12 +1714,12 @@ class QuietTodoWidget:
             add_sub.pack(side="right", padx=(2, 0))
             self.button_style(add_sub)
         self.button_style(delete)
-        if self.settings["locked"]:
+        if self.settings["locked"] or context_only:
             delete.configure(state="disabled")
             if add_sub:
                 add_sub.configure(state="disabled")
         if not self.is_collapsed(item_key):
-            for child in self.ordered_subtasks(item, item_key):
+            for child in visible_children:
                 self.render_subtask_row(
                     group, root_task, item, child, item_key, depth + 1
                 )
@@ -1537,6 +1793,138 @@ class QuietTodoWidget:
                 lambda item=entry: item.focus_set() if item.winfo_exists() else None
             )
 
+    def start_inline_title_edit(
+        self, label: tk.Label, current: str, commit_title
+    ) -> str:
+        if self.settings["locked"]:
+            return "break"
+        parent = label.master
+        siblings = parent.pack_slaves()
+        try:
+            next_widget = siblings[siblings.index(label) + 1]
+        except (ValueError, IndexError):
+            next_widget = None
+        pack_info = dict(label.pack_info())
+        pack_info.pop("in", None)
+        label.pack_forget()
+        background_rgb = color_rgb(self.settings["background"])
+        foreground_rgb = color_rgb(self.settings["foreground"])
+        selection_bg = rgb_color(blend(background_rgb, foreground_rgb, 0.42))
+        entry = tk.Entry(
+            parent,
+            relief="flat",
+            bd=0,
+            bg=self.settings["background"],
+            fg=self.settings["foreground"],
+            insertbackground=self.settings["foreground"],
+            font=label.cget("font"),
+            insertwidth=1,
+            highlightthickness=0,
+            selectbackground=selection_bg,
+            selectforeground=self.settings["foreground"],
+        )
+        entry.insert(0, current)
+        entry.icursor("end")
+        entry_pack = dict(pack_info)
+        if next_widget and next_widget.winfo_exists():
+            entry_pack["before"] = next_widget
+        entry.pack(**entry_pack)
+        entry.focus_set()
+
+        finished = {"value": False}
+
+        def restore() -> None:
+            if finished["value"]:
+                return
+            finished["value"] = True
+            if entry.winfo_exists():
+                entry.destroy()
+            label_pack = dict(pack_info)
+            if next_widget and next_widget.winfo_exists():
+                label_pack["before"] = next_widget
+            label.pack(**label_pack)
+
+        def commit(_event=None) -> str:
+            if finished["value"]:
+                return "break"
+            title = entry.get().strip()
+            if not title:
+                self.status_text.set("任务内容不能为空")
+                restore()
+                return "break"
+            restore()
+            commit_title(title)
+            return "break"
+
+        def cancel(_event=None) -> str:
+            restore()
+            return "break"
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Escape>", cancel)
+        return "break"
+
+    def start_task_title_edit(self, label: tk.Label, task: dict) -> str:
+        return self.start_inline_title_edit(
+            label,
+            task.get("title", ""),
+            lambda title, t=task: self.edit_task_title(t, title),
+        )
+
+    def start_subtask_title_edit(
+        self, label: tk.Label, root_task: dict, item: dict
+    ) -> str:
+        return self.start_inline_title_edit(
+            label,
+            item.get("title", ""),
+            lambda title, r=root_task, i=item: self.edit_subtask_title(r, i, title),
+        )
+
+    def edit_task_title(self, task: dict, title: str) -> None:
+        if self.settings["locked"]:
+            return
+        title = title.strip()
+        if not title or title == task.get("title"):
+            return
+        task["title"] = title
+        if task["source"] == "todo":
+            self.remote_store.save(self.remote_tasks)
+            self.render_tasks()
+            self.run_async(
+                lambda: self.graph.update_task_title(
+                    self.settings["todo_list_id"], task["id"], title
+                ),
+                lambda _result: self.sync_remote(),
+                "正在更新任务内容...",
+            )
+        else:
+            self.save_local_tasks()
+            self.status_text.set("已修改任务内容")
+            self.render_tasks()
+
+    def edit_subtask_title(self, root_task: dict, item: dict, title: str) -> None:
+        if self.settings["locked"]:
+            return
+        title = title.strip()
+        if not title or title == item.get("title"):
+            return
+        item["title"] = title
+        if root_task["source"] == "todo" and item.get("source") == "todo_subtask":
+            self.save_nested_changes(root_task)
+            self.render_tasks()
+            self.run_async(
+                lambda: self.graph.update_subtask_title(
+                    self.settings["todo_list_id"], root_task["id"], item["id"], title
+                ),
+                lambda _result: self.sync_remote(),
+                "正在更新子任务内容...",
+            )
+        else:
+            self.save_nested_changes(root_task)
+            self.status_text.set("已修改子任务内容")
+            self.render_tasks()
+
     def toggle_pin(self, task: dict) -> None:
         if self.settings["locked"]:
             return
@@ -1554,7 +1942,7 @@ class QuietTodoWidget:
             )
         else:
             task["pinned"] = pinned
-            self.local_store.save(self.local_tasks)
+            self.save_local_tasks()
             self.render_tasks()
 
     def start_node_drag(self, key: str, parent_key: str, _event=None) -> None:
@@ -1731,7 +2119,7 @@ class QuietTodoWidget:
             task = local_task(title)
             self.local_tasks.insert(0, task)
             self.put_task_first(self.task_key(task))
-            self.local_store.save(self.local_tasks)
+            self.save_local_tasks()
             self.status_text.set("已添加本地待办")
             self.render_tasks()
 
@@ -1814,7 +2202,7 @@ class QuietTodoWidget:
             )
         else:
             task["completed"] = completed
-            self.local_store.save(self.local_tasks)
+            self.save_local_tasks()
             self.render_tasks()
 
     def toggle_subtask(self, root_task: dict, item: dict, completed: bool) -> None:
@@ -1849,7 +2237,7 @@ class QuietTodoWidget:
             )
         else:
             self.local_tasks.remove(task)
-            self.local_store.save(self.local_tasks)
+            self.save_local_tasks()
             self.render_tasks()
 
     def delete_subtask(self, root_task: dict, parent: dict, item: dict) -> None:
@@ -1919,7 +2307,14 @@ class QuietTodoWidget:
         )
 
     def request_sync(self) -> None:
+        try:
+            obsidian_synced = self.sync_obsidian()
+        except OSError as exc:
+            obsidian_synced = False
+            self.status_text.set(f"Obsidian 同步失败: {exc}")
         self.sync_remote()
+        if obsidian_synced and (not self.settings["todo_list_id"] or not self.graph.configured):
+            self.status_text.set("Obsidian 已同步")
 
     def schedule_sync(self) -> None:
         if self.refresh_job:
@@ -1928,6 +2323,10 @@ class QuietTodoWidget:
         self.refresh_job = self.root.after(delay, self._periodic_sync)
 
     def _periodic_sync(self) -> None:
+        try:
+            self.sync_obsidian()
+        except OSError as exc:
+            self.status_text.set(f"Obsidian 同步失败: {exc}")
         self.sync_remote()
         self.schedule_sync()
 
@@ -1993,6 +2392,8 @@ class QuietTodoWidget:
             "foreground": tk.StringVar(value=self.settings["foreground"]),
             "muted": tk.StringVar(value=self.settings["muted"]),
             "accent": tk.StringVar(value=self.settings["accent"]),
+            "obsidian_enabled": tk.BooleanVar(value=self.settings["obsidian_enabled"]),
+            "obsidian_path": tk.StringVar(value=self.settings["obsidian_path"]),
             "client_id": tk.StringVar(value=self.settings["client_id"]),
             "tenant": tk.StringVar(value=self.settings["tenant"]),
             "todo_list": tk.StringVar(value=self.settings["todo_list_name"]),
@@ -2097,6 +2498,27 @@ class QuietTodoWidget:
             refresh_row, from_=1, to=60, textvariable=vars_["refresh_minutes"], width=5
         ).pack(side="left", padx=8)
 
+        section("Obsidian 联动")
+        tk.Label(
+            container,
+            text="选择一个 Markdown 清单文件；支持 Obsidian 的 - [ ] / - [x] 待办格式。",
+            bg="#f4f5f4",
+            fg="#5b6664",
+            anchor="w",
+            justify="left",
+        ).pack(fill="x")
+        check("启用 Obsidian 双向同步", "obsidian_enabled")
+        obsidian_row = tk.Frame(container, bg="#f4f5f4")
+        obsidian_row.pack(fill="x", pady=3)
+        tk.Entry(obsidian_row, textvariable=vars_["obsidian_path"]).pack(
+            side="left", fill="x", expand=True
+        )
+        tk.Button(
+            obsidian_row,
+            text="选择文件",
+            command=lambda: self.choose_obsidian_file(vars_),
+        ).pack(side="left", padx=(8, 0))
+
         section("Microsoft To Do 联动")
         tk.Label(
             container,
@@ -2136,6 +2558,18 @@ class QuietTodoWidget:
         row.pack(fill="x", pady=3)
         tk.Label(row, text=label, bg="#f4f5f4", width=24, anchor="w").pack(side="left")
         tk.Entry(row, textvariable=value).pack(side="left", fill="x", expand=True)
+
+    def choose_obsidian_file(self, vars_: dict) -> None:
+        initial = Path(vars_["obsidian_path"].get() or str(DEFAULT_OBSIDIAN_PATH))
+        selected = filedialog.askopenfilename(
+            parent=self.settings_window,
+            title="选择 Obsidian 待办 Markdown 文件",
+            initialdir=str(initial.parent if initial.parent.exists() else Path.home()),
+            filetypes=(("Markdown 文件", "*.md"), ("所有文件", "*.*")),
+        )
+        if selected:
+            vars_["obsidian_path"].set(selected)
+            vars_["obsidian_enabled"].set(True)
 
     def update_theme_preview(self, vars_: dict, preview: tk.Canvas) -> None:
         preview.configure(bg=vars_["background"].get())
@@ -2221,6 +2655,10 @@ class QuietTodoWidget:
 
     def save_settings_window(self, vars_: dict, window: tk.Toplevel) -> None:
         self.save_auth_fields(vars_)
+        old_obsidian = (
+            self.settings.get("obsidian_enabled"),
+            self.settings.get("obsidian_path"),
+        )
         self.settings["theme_preset"] = THEME_KEYS_BY_LABEL.get(
             vars_["theme_preset"].get(), "custom"
         )
@@ -2229,6 +2667,8 @@ class QuietTodoWidget:
         self.settings["font_family"] = vars_["font_family"].get()
         self.settings["font_size"] = vars_["font_size"].get()
         self.settings["refresh_minutes"] = vars_["refresh_minutes"].get()
+        self.settings["obsidian_enabled"] = vars_["obsidian_enabled"].get()
+        self.settings["obsidian_path"] = vars_["obsidian_path"].get().strip()
         for key in ("background", "foreground", "muted", "accent"):
             self.settings[key] = vars_[key].get()
         requested_startup = vars_["auto_start"].get()
@@ -2238,8 +2678,19 @@ class QuietTodoWidget:
         except OSError as exc:
             messagebox.showerror("开机启动设置失败", str(exc), parent=window)
         self.settings = normalize_settings(self.settings)
+        new_obsidian = (
+            self.settings.get("obsidian_enabled"),
+            self.settings.get("obsidian_path"),
+        )
+        if old_obsidian != new_obsidian:
+            self.obsidian_store = ObsidianTaskStore(Path(self.settings["obsidian_path"]))
+            self.local_tasks = self.load_local_tasks()
+            self.save_local_tasks()
+            self.obsidian_last_mtime_ns = self.current_obsidian_mtime()
+            self.render_tasks()
         self.apply_appearance(refresh_theme=True)
         self.schedule_sync()
+        self.schedule_obsidian_watch()
         window.destroy()
 
     def startup_command(self) -> str:
