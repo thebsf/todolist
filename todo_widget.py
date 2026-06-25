@@ -246,7 +246,9 @@ def normalize_settings(raw: dict | None) -> dict:
     settings["todo_list_name"] = str(settings.get("todo_list_name", "")).strip()
     settings["tenant"] = settings["tenant"] or "common"
     settings["task_view"] = (
-        settings.get("task_view") if settings.get("task_view") in ("pending", "completed") else "pending"
+        settings.get("task_view")
+        if settings.get("task_view") in ("pending", "completed", "archived")
+        else "pending"
     )
     order = settings.get("task_order", [])
     settings["task_order"] = list(dict.fromkeys(str(item) for item in order)) if isinstance(order, list) else []
@@ -282,6 +284,7 @@ def local_task(title: str) -> dict:
         "id": uuid.uuid4().hex,
         "title": title.strip(),
         "completed": False,
+        "archived": False,
         "pinned": False,
         "source": "local",
         "subtasks": [],
@@ -293,6 +296,7 @@ def local_subtask(title: str) -> dict:
         "id": uuid.uuid4().hex,
         "title": title.strip(),
         "completed": False,
+        "archived": False,
         "source": "local",
         "subtasks": [],
     }
@@ -314,6 +318,7 @@ class LocalTaskStore:
             task = local_task(str(raw["title"]))
             task["id"] = str(raw.get("id", task["id"]))
             task["completed"] = bool(raw.get("completed", False))
+            task["archived"] = bool(raw.get("archived", False))
             task["pinned"] = bool(raw.get("pinned", False))
             task["source"] = str(raw.get("source", self.root_source))
             task["subtasks"] = self.normalize_subtasks(raw.get("subtasks", []), depth=1)
@@ -330,6 +335,7 @@ class LocalTaskStore:
             item = local_subtask(str(raw["title"]))
             item["id"] = str(raw.get("id", item["id"]))
             item["completed"] = bool(raw.get("completed", False))
+            item["archived"] = bool(raw.get("archived", False))
             item["source"] = str(raw.get("source", "local"))
             item["subtasks"] = self.normalize_subtasks(raw.get("subtasks", []), depth + 1)
             normalized.append(item)
@@ -372,6 +378,7 @@ class ObsidianTaskStore:
                 "id": task_id,
                 "title": title,
                 "completed": match.group("checked").lower() == "x",
+                "archived": False,
                 "pinned": False,
                 "source": "local",
                 "subtasks": [],
@@ -734,6 +741,14 @@ class QuietTodoWidget:
             bd=0,
         )
         self.completed_button.pack(side="left")
+        self.archived_button = tk.Button(
+            self.controls,
+            text="归档",
+            command=lambda: self.set_task_view("archived"),
+            relief="flat",
+            bd=0,
+        )
+        self.archived_button.pack(side="left", padx=(4, 0))
         self.lock_button = tk.Button(
             self.controls, command=self.toggle_lock, relief="flat", bd=0
         )
@@ -969,6 +984,9 @@ class QuietTodoWidget:
         self.button_style(
             self.completed_button, accent=self.settings["task_view"] == "completed"
         )
+        self.button_style(
+            self.archived_button, accent=self.settings["task_view"] == "archived"
+        )
         self.update_locked_layout()
         self.send_to_bottom()
         write_json(SETTINGS_PATH, self.settings)
@@ -1126,6 +1144,7 @@ class QuietTodoWidget:
         for button in (
             self.pending_button,
             self.completed_button,
+            self.archived_button,
             self.settings_button,
             self.sync_button,
             self.collapse_all_button,
@@ -1133,9 +1152,9 @@ class QuietTodoWidget:
             button.configure(state="normal")
 
     def set_task_view(self, view: str) -> None:
-        if view not in ("pending", "completed"):
+        if view not in ("pending", "completed", "archived"):
             return
-        if view == "completed":
+        if view != "pending":
             self.input_text.set("")
             self.subtask_draft_text.set("")
             self.subtask_draft_parent_key = None
@@ -1143,6 +1162,7 @@ class QuietTodoWidget:
         write_json(SETTINGS_PATH, self.settings)
         self.button_style(self.pending_button, accent=view == "pending")
         self.button_style(self.completed_button, accent=view == "completed")
+        self.button_style(self.archived_button, accent=view == "archived")
         self.render_tasks()
 
     def send_to_bottom(self) -> None:
@@ -1170,14 +1190,24 @@ class QuietTodoWidget:
     def display_tasks(self) -> list[dict]:
         tasks = self.local_tasks + self.remote_tasks
         self.ensure_task_order(tasks)
-        if self.settings["task_view"] == "completed":
+        if self.settings["task_view"] == "archived":
+            shown = [task for task in tasks if task.get("archived")]
+        elif self.settings["task_view"] == "completed":
             shown = [
                 task
                 for task in tasks
-                if task["completed"] or self.has_visible_subtasks(task, self.task_key(task))
+                if not task.get("archived")
+                and (
+                    task["completed"]
+                    or self.has_visible_subtasks(task, self.task_key(task))
+                )
             ]
         else:
-            shown = [task for task in tasks if not task["completed"]]
+            shown = [
+                task
+                for task in tasks
+                if not task["completed"] and not task.get("archived")
+            ]
         position = {key: index for index, key in enumerate(self.settings["task_order"])}
         return sorted(
             shown,
@@ -1269,6 +1299,10 @@ class QuietTodoWidget:
         self.render_tasks()
 
     def is_visible_in_current_view(self, node: dict, node_key: str) -> bool:
+        if self.settings["task_view"] == "archived":
+            return True
+        if node.get("archived"):
+            return False
         if self.settings["task_view"] == "completed":
             return bool(node.get("completed") or self.has_visible_subtasks(node, node_key))
         return not bool(node.get("completed"))
@@ -1356,14 +1390,6 @@ class QuietTodoWidget:
         )
 
     def merge_remote_nested(self, tasks: list[dict]) -> list[dict]:
-        for task in tasks:
-            task_key = self.task_key(task)
-            for item in task.get("subtasks", []):
-                key = self.child_key(task_key, item)
-                item["subtasks"] = copy.deepcopy(self.settings["remote_nested"].get(key, []))
-        return tasks
-
-    def merge_local_metadata(self, tasks: list[dict]) -> list[dict]:
         existing: dict[str, dict] = {}
 
         def collect(node: dict) -> None:
@@ -1371,7 +1397,39 @@ class QuietTodoWidget:
             for child in node.get("subtasks", []):
                 collect(child)
 
-        for task in self.local_tasks if hasattr(self, "local_tasks") else []:
+        for task in self.remote_tasks if hasattr(self, "remote_tasks") else []:
+            collect(task)
+        for task in tasks:
+            prior = existing.get(str(task.get("id", "")))
+            task["archived"] = bool(prior.get("archived", False)) if prior else False
+            task_key = self.task_key(task)
+            for item in task.get("subtasks", []):
+                prior_child = existing.get(str(item.get("id", "")))
+                item["archived"] = (
+                    bool(prior_child.get("archived", False)) if prior_child else False
+                )
+                key = self.child_key(task_key, item)
+                item["subtasks"] = copy.deepcopy(self.settings["remote_nested"].get(key, []))
+        return tasks
+
+    def merge_local_metadata(
+        self, tasks: list[dict], metadata_tasks: list[dict] | None = None
+    ) -> list[dict]:
+        existing: dict[str, dict] = {}
+
+        def collect(node: dict) -> None:
+            existing[str(node.get("id", ""))] = node
+            for child in node.get("subtasks", []):
+                collect(child)
+
+        source_tasks = (
+            metadata_tasks
+            if metadata_tasks is not None
+            else self.local_tasks
+            if hasattr(self, "local_tasks")
+            else []
+        )
+        for task in source_tasks:
             collect(task)
 
         def apply(node: dict, is_root: bool) -> None:
@@ -1379,6 +1437,7 @@ class QuietTodoWidget:
             node["source"] = "local"
             if is_root and prior:
                 node["pinned"] = bool(prior.get("pinned", False))
+            node["archived"] = bool(prior.get("archived", False)) if prior else False
             for child in node.get("subtasks", []):
                 apply(child, False)
 
@@ -1396,7 +1455,7 @@ class QuietTodoWidget:
         self.obsidian_store = ObsidianTaskStore(Path(self.settings["obsidian_path"]))
         obsidian_tasks = self.obsidian_store.load()
         if obsidian_tasks or self.obsidian_store.path.exists():
-            return self.merge_local_metadata(obsidian_tasks)
+            return self.merge_local_metadata(obsidian_tasks, json_tasks)
         try:
             self.obsidian_store.save(json_tasks)
         except OSError:
@@ -1488,11 +1547,12 @@ class QuietTodoWidget:
             self.subtask_draft_entry = None
             tasks = self.display_tasks()
             if not tasks:
-                empty = (
-                    "没有已完成任务"
-                    if self.settings["task_view"] == "completed"
-                    else "输入一项任务开始"
-                )
+                if self.settings["task_view"] == "archived":
+                    empty = "没有归档任务"
+                elif self.settings["task_view"] == "completed":
+                    empty = "没有已完成任务"
+                else:
+                    empty = "输入一项任务开始"
                 tk.Label(
                     self.tasks_frame,
                     text=empty,
@@ -1532,7 +1592,12 @@ class QuietTodoWidget:
         fg = self.settings["muted"] if task["completed"] else self.settings["foreground"]
         key = self.task_key(task)
         visible_children = self.visible_subtasks(task, key)
-        context_only = self.settings["task_view"] == "completed" and not task["completed"]
+        context_only = (
+            self.settings["task_view"] == "completed"
+            and not task["completed"]
+            or self.settings["task_view"] == "archived"
+            and not task.get("archived")
+        )
         group = tk.Frame(
             self.tasks_frame,
             bg=bg,
@@ -1589,7 +1654,7 @@ class QuietTodoWidget:
             font=self.font(),
             justify="left",
             anchor="w",
-            wraplength=max(130, self.root.winfo_width() - 136),
+            wraplength=max(120, self.root.winfo_width() - 164),
         )
         title.pack(side="left", fill="x", expand=True, pady=2)
         if not self.settings["locked"] and not context_only:
@@ -1617,10 +1682,23 @@ class QuietTodoWidget:
             )
             add_sub.pack(side="right", padx=(2, 0))
             self.button_style(add_sub)
+        archive = tk.Button(
+            row,
+            text="\ue7a7" if self.settings["task_view"] == "archived" else "\ue7b8",
+            command=lambda t=task: self.set_task_archived(
+                t, self.settings["task_view"] != "archived"
+            ),
+            relief="flat",
+            bd=0,
+        )
+        archive.pack(side="right", padx=(2, 0))
+        self.button_style(archive)
+        archive.configure(font=("Segoe MDL2 Assets", max(8, self.settings["font_size"] - 1)))
         self.button_style(delete)
         if self.settings["locked"] or context_only:
             if add_sub:
                 add_sub.configure(state="disabled")
+            archive.configure(state="disabled")
             delete.configure(state="disabled")
         if not self.is_collapsed(key):
             for item in visible_children:
@@ -1646,7 +1724,12 @@ class QuietTodoWidget:
         row.pack(fill="x", padx=(19 + (depth * 10), 0), pady=1)
         item_key = self.child_key(parent_key, item)
         visible_children = self.visible_subtasks(item, item_key)
-        context_only = self.settings["task_view"] == "completed" and not item["completed"]
+        context_only = (
+            self.settings["task_view"] == "completed"
+            and not item["completed"]
+            or self.settings["task_view"] == "archived"
+            and not item.get("archived")
+        )
         self.drag_rows.append((item_key, parent_key, row))
         handle = tk.Label(
             row,
@@ -2223,6 +2306,17 @@ class QuietTodoWidget:
             item["completed"] = completed
             self.save_nested_changes(root_task)
             self.render_tasks()
+
+    def set_task_archived(self, task: dict, archived: bool) -> None:
+        if self.settings["locked"]:
+            return
+        task["archived"] = archived
+        if task["source"] == "todo":
+            self.remote_store.save(self.remote_tasks)
+        else:
+            self.save_local_tasks()
+        self.status_text.set("已归档任务" if archived else "已撤回归档")
+        self.render_tasks()
 
     def delete_task(self, task: dict) -> None:
         if self.settings["locked"]:

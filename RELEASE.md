@@ -1,5 +1,17 @@
 # Release Notes
 
+## 2026.06.25
+
+### Added
+
+- Added an archive view for root tasks. Archived tasks are hidden from the pending and completed views, and can be restored from the archive view.
+
+### Changed
+
+- Archive controls now appear only on root task rows; subtasks remain visible under their archived parent task.
+- Archived root tasks keep their full subtask tree visible, including the existing fold and unfold behavior.
+- The restore control in the archive view now uses a back-arrow icon for clearer intent.
+
 ## 2026.06.22
 
 ### Added
