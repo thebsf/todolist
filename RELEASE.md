@@ -1,5 +1,11 @@
 # Release Notes
 
+## 2026.06.30
+
+### Fixed
+
+- Fixed a window recovery issue after monitor layout changes. If the saved widget position is outside the current visible screen area, the app now moves it back onto the available desktop at startup and saves the corrected position.
+
 ## 2026.06.25
 
 ### Added

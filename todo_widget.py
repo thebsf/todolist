@@ -118,6 +118,9 @@ THEME_LABELS = [definition["label"] for definition in THEME_PRESETS.values()]
 THEME_KEYS_BY_LABEL = {
     definition["label"]: key for key, definition in THEME_PRESETS.items()
 }
+GEOMETRY_RE = re.compile(
+    r"^(?P<width>\d+)x(?P<height>\d+)(?P<x>[+-]-?\d+)(?P<y>[+-]-?\d+)$"
+)
 
 
 class GraphError(RuntimeError):
@@ -204,6 +207,75 @@ def normalize_color(value: str, fallback: str) -> str:
         except ValueError:
             pass
     return fallback
+
+
+def parse_geometry(value: str) -> tuple[int, int, int, int] | None:
+    match = GEOMETRY_RE.match(str(value).strip())
+    if not match:
+        return None
+    x_value = match.group("x")
+    y_value = match.group("y")
+    return (
+        int(match.group("width")),
+        int(match.group("height")),
+        int(x_value[1:] if x_value.startswith("+") else x_value),
+        int(y_value[1:] if y_value.startswith("+") else y_value),
+    )
+
+
+def format_geometry(width: int, height: int, x: int, y: int) -> str:
+    return f"{width}x{height}{x:+d}{y:+d}"
+
+
+def virtual_screen_bounds(root: tk.Tk | None = None) -> tuple[int, int, int, int] | None:
+    if os.name == "nt":
+        user32 = ctypes.windll.user32
+        width = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        height = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if width > 0 and height > 0:
+            return (
+                user32.GetSystemMetrics(76),  # SM_XVIRTUALSCREEN
+                user32.GetSystemMetrics(77),  # SM_YVIRTUALSCREEN
+                width,
+                height,
+            )
+    if root is not None:
+        try:
+            return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+        except tk.TclError:
+            return None
+    return None
+
+
+def visible_window_geometry(geometry: str, root: tk.Tk | None = None) -> str:
+    parsed = parse_geometry(geometry) or parse_geometry(DEFAULT_SETTINGS["geometry"])
+    bounds = virtual_screen_bounds(root)
+    if not parsed or not bounds:
+        return geometry
+    width, height, x, y = parsed
+    screen_x, screen_y, screen_width, screen_height = bounds
+    screen_right = screen_x + screen_width
+    screen_bottom = screen_y + screen_height
+    visible_width = max(0, min(x + width, screen_right) - max(x, screen_x))
+    visible_height = max(0, min(y + height, screen_bottom) - max(y, screen_y))
+    required_width = min(width, 120)
+    required_height = min(height, 90)
+    if visible_width >= required_width and visible_height >= required_height:
+        return format_geometry(width, height, x, y)
+
+    margin = 24
+    fitted_width = min(width, max(required_width, screen_width - margin * 2))
+    fitted_height = min(height, max(required_height, screen_height - margin * 2))
+    min_x = screen_x + margin
+    min_y = screen_y + margin
+    max_x = max(min_x, screen_right - fitted_width - margin)
+    max_y = max(min_y, screen_bottom - fitted_height - margin)
+    return format_geometry(
+        width,
+        height,
+        min(max(x, min_x), max_x),
+        min(max(y, min_y), max_y),
+    )
 
 
 def normalize_settings(raw: dict | None) -> dict:
@@ -708,7 +780,11 @@ class QuietTodoWidget:
 
     def _configure_window(self) -> None:
         self.root.title(APP_TITLE)
-        self.root.geometry(self.settings["geometry"])
+        geometry = visible_window_geometry(self.settings["geometry"], self.root)
+        if geometry != self.settings["geometry"]:
+            self.settings["geometry"] = geometry
+            write_json(SETTINGS_PATH, self.settings)
+        self.root.geometry(geometry)
         self.root.minsize(280, 260)
         self.root.overrideredirect(True)
         try:
